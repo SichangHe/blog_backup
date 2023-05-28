@@ -3,7 +3,7 @@
 With [the release of mdBook-KaTeX v0.5.1](https://github.com/lzanini/mdbook-katex/releases/tag/v0.5.1), I have finally cleaned up the mess it was in.
 
 - The fake KaTeX renderer support is finally dropped in v0.5.0, specifying `[output.katex]` in `book.toml` now results in an error as opposed to a deprecation warning.
-- Tokio has been removed as a dependency. In stead, we use Rayon for the parallelism.
+- [Tokio](https://crates.io/crates/tokio) has been removed as a dependency. In stead, we now use [Rayon](https://crates.io/crates/rayon) for the parallelism.
 
 But, first, what does [mdBook-KaTeX](https://github.com/lzanini/mdbook-katex) do? It is an mdBook preprocessor that pre-renders math expressions. For example:
 
@@ -34,7 +34,7 @@ What does an mdBook preprocessor do? Well, in a nutshell, [mdBook preprocessors]
 
 This sounds abstract, though, so let's dive into what mdBook-KaTeX does, with code, as a concrete example.
 
-## What does mdBook-KaTeX do as an mdBook preprocessor
+## mdBook-KaTeX as a CLI App
 
 mdBook-KaTeX is, firstly, a Command Line Interface (CLI) App written in Rust. It uses [Clap](https://github.com/clap-rs/clap) to parse the arguments passed in:
 
@@ -67,7 +67,7 @@ Caused by:
 
 We don't use the `mdbook-katex` command directly, though. Instead, mdBook would invoke it when it builds the book.
 
-### The `supports` command
+## The `supports` command
 
 All preprocessors need to have this command so mdBook can check whether it supports a renderer.
 
@@ -79,7 +79,7 @@ mdbook-katex supports html
 
 In this case, mdBook-KaTeX would just output nothing with status code 0 to indicate that we support the `html` renderer.
 
-### Reading and processing the book data from StdIn
+## Reading and processing the book data from StdIn
 
 If no command is specified, mdBook-KaTeX should read the book data as JSON from StdIn.
 
@@ -90,7 +90,7 @@ let processed_book = pre.run(&ctx, book)?;
 serde_json::to_writer(io::stdout(), &processed_book)?;
 ```
 
-Here, we read the context `ctx: PreprocessorContext` and the book data `book: Book` from StdIn using `mdbook::preprocess::cmd::CmdPreprocessor`, run it through our preprocessor `pre` and get the `processed_book: Book`, and print it back out to StdOut, where mdBook would catch it and use the book.
+Here, we read the context `ctx: PreprocessorContext` and the book data `book: Book` from StdIn using `mdbook::preprocess::CmdPreprocessor`, run it through our preprocessor `pre` and get the `processed_book: Book`, and print it back out to StdOut, where mdBook would catch it and use the book.
 
 So far, the process above is basically universal for any mdBook preprocessors. Yes, you can copy the code from `main.rs` from mdBook-KaTeX and start your own preprocessor. The only change to use other preprocessors would be replacing the `KatexProcessor` with another `struct` that implements `mdbook::preprocess::Preprocessor`:
 
@@ -104,6 +104,99 @@ pub trait Preprocessor {
 
 `name` and `supports_renderer` are trivial, but `run` is where the fun lives. For `KatexProcessor`, it finds the math expressions in each chapter of `book` and render them.
 
-### Processing `book`
+## Processing `book`
 
-<!-- TODO: -->
+Simply stated, we just loop over the `chapters: Vec<String>` in the `book` variable above, loop over the bytes in each chapter, replace math expression with rendered HTML, and stick them back.
+
+```rust
+fn run(&self, ctx: &PreprocessorContext, mut book: Book) -> Result<Book, Error> {
+    // …
+    book.for_each_mut(|item| {
+        if let BookItem::Chapter(chapter) = item {
+            if let Some(path) = &chapter.path {
+                chapter.content = process_chapter(&chapter.content, /* … */)
+            }
+        }
+    });
+    Ok(book)
+}
+
+```
+
+Above, we use the `for_each_mut` method on `book` to iterate over its items and mutate them. We filter out the `item: &mut BookItem`s that are `BookItem::Chapter`. We then call `process_chapter` on their `content: String` and assign the result back.
+
+Below, we have a simplified version of `process_chapter`. `scan: Scan` is a custom scanner that scans through each byte in `raw_content: &str` and produces `Event`s that indicate the beginnings and ends of blocks.
+
+```rust
+fn process_chapter(raw_content: String, /* other args */) -> String {
+    let scan = Scan::new(&raw_content, /* … */);
+    let mut rendered = Vec::new();
+
+    let mut checkpoint = 0;
+    for event in scan {
+        match event {
+            Event::TextEnd(end) => rendered.push((&raw_content[checkpoint..end]).into()),
+            Event::InlineEnd(end) => {
+                rendered.push(render(&raw_content[checkpoint..end], /* … */));
+                checkpoint = end;
+            }
+            // …
+        }
+    }
+    // …
+
+    rendered.join("")
+}
+```
+
+Based on the types of the `Event`, we identify text blocks and math blocks, and apply the `render` function only to the math blocks. The `render` function then uses [the `katex` crate](https://crates.io/crates/katex) to render HTML. Finally, we `join` all the strings in `rendered: Vec<String>`.
+
+## What next
+
+If you have been following along, I hope you got a gist about how an mdBook preprocessor works and probably how to write one yourself! (If not, leave a question below).
+
+In reality, though, the code for mdBook-KaTeX is way more complicated due to:
+
+- configuration options, and
+- parallelism.
+
+[mdBook-KaTeX offers a wide range of options](https://github.com/lzanini/mdbook-katex#katex-options), they are read from the `ctx: &PreprocessorContext` passed into the `run` method. Then, we further parse the configurations and pass them around.
+
+Parallelism is more interesting. Since the `katex` crate uses [QuickJs](https://crates.io/crates/quick-js) to render KaTeX, which is ironically slow, KaTeX rendering has been the performance bottleneck. Initially, by manually scheduling render tasks using [Tokio](https://crates.io/crates/tokio), I was able to get 5x speed on my M1 Mac, from 10sec to 2sec.
+
+In v0.5.0, we switched to [Rayon](https://crates.io/crates/rayon) for simplicity, but the basic ideas are the same. To spawn threads and get parallelism, each thread ideally needs to own its data. So, we need to scan for tasks first, save them in vectors, and then execute the tasks in the vector in parallel. For example, this is how we actually parallelize processing each chapter:
+
+```rust
+let mut chapters = Vec::with_capacity(book.sections.len());
+book.for_each_mut(|item| {
+    if let BookItem::Chapter(chapter) = item {
+        chapters.push(chapter.content.clone());
+    }
+});
+let mut contents: Vec<_> = chapters
+    .into_par_iter()
+    .rev()
+    .map(|raw_content| process_chapter(raw_content, /* … */))
+    .collect();
+book.for_each_mut(|item| {
+    if let BookItem::Chapter(chapter) = item {
+        chapter.content = contents.pop().expect("Chapter number mismatch.");
+    }
+});
+```
+
+- We have to clone each chapter's content and save them into a vector `chapters` for each thread to own the chapter they process.
+- We use the `into_par_iter` method for `Vec` and the `map` method, which Rayon provides, to process the chapters in parallel.
+- We call `rev` to iterate the chapters in reverse order, so when we put the rendered chapters back into the book, we can simply call `pop` on the contents to get them in the correct order.
+
+## Conclusion
+
+In summary, we have walked through mdBook-KaTeX as an mdBook preprocessor example to show what a preprocessor does:
+
+- Handle `supports` command.
+- Read the book from StdIn and parse it.
+- Process the book by looping through its content and changing them.
+- Other enhancement such as option handling and parallelism.
+
+This sounds quite easy.
+But, why was mdBook-KaTeX in a mess? Why did it have a fake renderer? Why did it use Tokio? Well, I will save the story to another article.
