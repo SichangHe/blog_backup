@@ -1,11 +1,4 @@
-# What Does an mdBook Preprocessor Do—Celebrating mdBook-KaTeX v0.5.1
-
-## Prelude
-
-With [the release of mdBook-KaTeX v0.5.1](https://github.com/lzanini/mdbook-katex/releases/tag/v0.5.1), I have finally cleaned up the mess it was in:
-
-- The fake KaTeX renderer support is finally dropped in v0.5.0, so [issue 68](https://github.com/lzanini/mdbook-katex/issues/68) has been closed as completed.
-- [Tokio](https://crates.io/crates/tokio) has been removed as a dependency. In stead, we now use [Rayon](https://crates.io/crates/rayon) for the parallelism.
+# What Does an mdBook Preprocessor Do—Code Walk-through of mdBook-KaTeX
 
 But, first, what does [mdBook-KaTeX](https://github.com/lzanini/mdbook-katex) do? It is an mdBook preprocessor that pre-renders math expressions. For example, if you have this following snippet in your book:
 
@@ -205,12 +198,3 @@ In summary, we have walked through mdBook-KaTeX as an mdBook preprocessor exampl
 - Process the book by looping through its content and changing them.
 - Print the book back to StdOut.
 - Other enhancement such as option handling and parallelism.
-
-This sounds quite easy.
-But:
-
-- Why was mdBook-KaTeX in a mess?
-- Why did it have a fake renderer?
-- Why was it using Tokio?
-
-Well, I will save the story to another time.
